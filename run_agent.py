@@ -16,8 +16,9 @@ import tempfile
 import time
 
 from csv_plan import (
-    NO_RATIO_DENOMINATOR, NO_UNIQUE_GROUP, PLAN_PROMPT, describe as describe_csv,
-    evaluate as evaluate_csv, local_plan, missing_measure, numeric_text,
+    GROUP_RATIO_PROMPT, JOIN_PROMPT, NO_RATIO_DENOMINATOR, NO_UNIQUE_GROUP, PLAN_PROMPT,
+    decimal_places, describe as describe_csv, evaluate as evaluate_csv, grouped_ratio_evaluate,
+    join_evaluate, local_plan, missing_measure, numeric_text,
 )
 from python_repairs import acceptable_patch, apply_numbered_edits, conflicting_assertions, numbered_lines, simple_candidates
 from search_evidence import (
@@ -994,12 +995,37 @@ async def solve_remote(task, proxy, paths):
                 previous = excerpts
                 rejected = not response.get("skip")
             return "skip", "no_cited_answer"
+    join_paths = csv_join_paths(task, paths)
+    if join_paths and proxy.enabled:
+        tables = await asyncio.to_thread(lambda: {name: describe_csv(path, task.instruction)
+                                                   for name, path in join_paths.items()})
+        plan = await proxy.ask(task.root.name, JOIN_PROMPT, {"task": task.instruction, "tables": tables}, 340)
+        if plan and plan.get("skip") is True:
+            return "skip", "csv_join_missing_data"
+        if plan and "join" in plan:
+            places = decimal_places(task.instruction)
+            if places is not None:
+                plan = plan | {"dp": places}
+            answer = await asyncio.to_thread(join_evaluate, join_paths, plan)
+            if isinstance(answer, str) and (task.check != "exact_int" or re.fullmatch(r"[+-]?\d+", answer)):
+                return "llm_solved", answer
     plan_csv = csv_plan_path(task, paths)
     if plan_csv is not None and proxy.enabled:
-        schema = await asyncio.to_thread(describe_csv, plan_csv, task.instruction)
+        grouped_ratio = requests_group_ratio(task.instruction)
+        schema = await asyncio.to_thread(describe_csv, plan_csv, task.instruction, include_values=grouped_ratio)
         if missing_measure(task.instruction, schema["columns"]):
             return "skip", "csv_missing_measure"
         payload = {"task": task.instruction, **schema}
+        if grouped_ratio:
+            plan = await proxy.ask(task.root.name, GROUP_RATIO_PROMPT, payload, 260)
+            if plan and plan.get("skip") is True:
+                return "skip", "csv_missing_measure"
+            answer = await asyncio.to_thread(grouped_ratio_evaluate, plan_csv, plan)
+            if answer is NO_UNIQUE_GROUP:
+                return "skip", "csv_group_tie_or_empty"
+            if isinstance(answer, str) and (task.check != "exact_int" or re.fullmatch(r"[+-]?\d+", answer)):
+                return "llm_solved", answer
+            payload.pop("observed_values", None)
         prompt = PLAN_PROMPT
         if "mentioned_labels" in schema:
             prompt += (
@@ -1100,6 +1126,25 @@ def csv_plan_path(task, paths):
     if path.suffix.lower() != ".csv" or path.name.casefold() not in task.instruction.casefold():
         return None
     return path if path.stat().st_size <= MAX_PLAN_CSV else None
+
+
+def csv_join_paths(task, paths):
+    if task.kind != "data_analysis" or len(paths) != 2:
+        return {}
+    question = task.instruction.casefold()
+    if (not re.search(r"\b(?:join|match|link|merge)\w*\b", question)
+            or re.search(r"\b(?:left|right|outer|full|cross|anti) join\b|\b(?:keep|retain|include) unmatched\b", question)):
+        return {}
+    tables = {path.name: path for path in paths if path.suffix.lower() == ".csv"
+              and path.name.casefold() in question and path.stat().st_size <= MAX_PLAN_CSV}
+    return tables if len(tables) == 2 else {}
+
+
+def requests_group_ratio(question):
+    return bool(re.search(r"\bwhich\b", question, re.I)
+            and re.search(r"\b(?:rate|share|fraction|ratio|proportion|percentage)\b", question, re.I)
+            and re.search(r"\b(?:at least|more than|minimum(?: of)?)\b", question, re.I)
+            and re.search(r"\b(?:highest|lowest|largest|smallest|greatest|best|worst|maximum|minimum)\b", question, re.I))
 
 
 def can_focus_search(task):
