@@ -28,7 +28,8 @@ SEARCH_PROMPT = (
     'For a found answer, return JSON {"answer":"exact short value","evidence":"verbatim short '
     'quote containing that exact value"}. The answer must be a continuous excerpt from the '
     'quote. Return {"skip":true} if the excerpts do not establish an exact answer. '
-    'Never infer missing facts.'
+    'Never infer missing facts. A draft, an obsolete value or a record outside its effective '
+    'interval cannot support a current answer. A gap between intervals requires skip.'
 )
 
 
@@ -54,6 +55,55 @@ def search_bytes(paths):
         return 0
     total = sum(path.stat().st_size for path in paths)
     return total if MIN_INDEX_BYTES <= total <= MAX_INDEX_BYTES else 0
+
+
+def interval_lookup(paths, question):
+    """Resolve an explicit time lookup in a Markdown table with half-open ranges."""
+    clock = r"(?:[01]\d|2[0-3]):[0-5]\d"
+    times = re.findall(rf"(?<!\d){clock}(?!\d)", question)
+    if len(times) != 1 or not re.search(r"\binclusive starts? and exclusive ends?\b", question, re.I):
+        return None
+    date = re.search(r"\b\d{4}-\d{2}-\d{2}\b", question)
+    query = normalize(question)
+    found = set()
+    roles = (
+        {"site", "station", "location", "area", "office", "location name", "name"},
+        {"from", "start", "start time", "starts", "valid from"},
+        {"to", "until", "end", "end time", "ends", "valid until"},
+    )
+    for path in paths:
+        if path.suffix.lower() not in TEXT_EXTENSIONS or path.stat().st_size > 200_000:
+            continue
+        columns = None
+        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            if not line.strip().startswith("|"):
+                columns = None
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            names = [normalize(cell) for cell in cells]
+            if columns is None:
+                indexes = [[i for i, name in enumerate(names) if name in role] for role in roles]
+                if any(len(index) != 1 for index in indexes):
+                    continue
+                entity, start, end = (index[0] for index in indexes)
+                date_columns = [i for i, name in enumerate(names) if name in {"date", "day"}]
+                date_column = date_columns[0] if len(date_columns) == 1 else None
+                fields = [i for i, name in enumerate(names) if i not in (entity, start, end, date_column)
+                          and name and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", query)]
+                if len(fields) != 1 or len(date_columns) > 1 or date_columns and date is None:
+                    continue
+                columns = entity, start, end, fields[0], date_column, len(cells)
+                continue
+            entity, start, end, field, date_column, width = columns
+            if len(cells) != width or not all(re.fullmatch(clock, cells[i]) for i in (start, end)):
+                continue
+            if date_column is not None and cells[date_column] != date[0]:
+                continue
+            entity_name = normalize(cells[entity])
+            if (entity_name and cells[field] and cells[start] <= times[0] < cells[end]
+                    and re.search(r"(?<!\w)" + re.escape(entity_name) + r"(?!\w)", query)):
+                found.add(cells[field])
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def chunks(text):

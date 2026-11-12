@@ -16,13 +16,13 @@ import tempfile
 import time
 
 from csv_plan import (
-    GROUP_RATIO_PROMPT, JOIN_PROMPT, NO_RATIO_DENOMINATOR, NO_UNIQUE_GROUP, PLAN_PROMPT,
-    decimal_places, describe as describe_csv, evaluate as evaluate_csv, grouped_ratio_evaluate,
+    JOIN_PROMPT, NO_RATIO_DENOMINATOR, NO_UNIQUE_GROUP, PLAN_PROMPT, POPULATION_PROMPT,
+    decimal_places, describe as describe_csv, evaluate as evaluate_csv,
     join_evaluate, local_plan, missing_measure, numeric_text,
 )
 from python_repairs import acceptable_patch, apply_numbered_edits, conflicting_assertions, numbered_lines, simple_candidates
 from search_evidence import (
-    EXTENDED_CONTEXT, FIRST_CONTEXT, SEARCH_PROMPT, cited_answer, pack, ranked_excerpts, search_bytes,
+    EXTENDED_CONTEXT, FIRST_CONTEXT, SEARCH_PROMPT, cited_answer, interval_lookup, pack, ranked_excerpts, search_bytes,
 )
 
 MODELS = (
@@ -540,14 +540,104 @@ def search_answer(task):
     return (company[0].get("Headquarters") if company else None) or missing
 
 
+FRACTION_FORMAT = re.compile(
+    r"\b(?:reduced|simplified|irreducible) fraction\b|\bfraction in (?:lowest|simplest) terms\b"
+    r"|\b(?:a/b|numerator\s*/\s*denominator)\b",
+    re.I,
+)
+SMALL_NUMBERS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+                 "nine", "ten", "eleven", "twelve")
+
+
+def math_output(text, question):
+    if FRACTION_FORMAT.search(question):
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:\s*/\s*[+-]?\d+)?", text):
+            return None
+        return exact_expression(text, as_fraction=True)
+    return text
+
+
+def bounded_math(question):
+    subsets = re.fullmatch(
+        rf"How many subsets of (?:exactly )?(\d+|{'|'.join(SMALL_NUMBERS)}) elements from "
+        r"(?:\{\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(?:\.{3}|…)\s*,\s*(-?\d+)\s*\}|"
+        r"(?:the )?integers (-?\d+) (?:through|to) (-?\d+)) "
+        r"have a sum divisible by (\d+)\?\s*(?:Give an integer\.)?",
+        question.strip(), re.I,
+    )
+    if subsets:
+        size = int(subsets[1]) if subsets[1].isdigit() else SMALL_NUMBERS.index(subsets[1].lower())
+        start = int(subsets[2] or subsets[5])
+        end = int(subsets[4] or subsets[6])
+        modulus = int(subsets[7])
+        if not (0 <= size <= 32 and 0 <= end - start < 200 and 1 <= modulus <= 256):
+            return None
+        if subsets[3] is not None and int(subsets[3]) != start + 1:
+            return None
+        counts = [[0] * modulus for _ in range(size + 1)]
+        counts[0][0] = 1
+        for used, value in enumerate(range(start, end + 1), 1):
+            for count in range(min(size, used), 0, -1):
+                for remainder, ways in enumerate(counts[count - 1]):
+                    counts[count][(remainder + value) % modulus] += ways
+        return str(counts[size][0])
+
+    point = r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)"
+    route = re.fullmatch(
+        rf"From {point} to {point},? take unit steps east or north\. "
+        rf"How many paths avoid (?:both )?({point}(?:(?:,\s*(?:and )?|\s+and\s+){point})*)\?",
+        question.strip(), re.I,
+    )
+    if route:
+        start = int(route[1]), int(route[2])
+        end = int(route[3]), int(route[4])
+        if any(not 0 <= b - a <= 500 for a, b in zip(start, end)):
+            return None
+        blocked = {(int(x), int(y)) for x, y in re.findall(point, route[5])}
+        if len(blocked) > 40:
+            return None
+        if start in blocked or end in blocked:
+            return "0"
+        # Subtract paths when they first hit an obstacle, so overlaps count only once.
+        def paths(origin, destination):
+            dx, dy = (b - a for a, b in zip(origin, destination))
+            return math.comb(dx + dy, dx) if dx >= 0 and dy >= 0 else 0
+
+        obstacles = sorted(p for p in blocked if paths(start, p) and paths(p, end))
+        ways = {}
+        for location in [*obstacles, end]:
+            ways[location] = paths(start, location) - sum(
+                count * paths(obstacle, location) for obstacle, count in ways.items()
+            )
+        return str(ways[end])
+
+    rectangle = re.fullmatch(
+        r"A rectangle has (?:a )?perimeter (?:of )?(\d+) and integer side lengths\. "
+        r"Its longer side is at least (\d+) and at most (\d+)\. "
+        r"(?:What is|Find) (?:its|the) (?:exact )?area[?.]",
+        question.strip(), re.I,
+    )
+    if rectangle:
+        perimeter, low, high = map(int, rectangle.groups())
+        total = perimeter // 2
+        low, high = max(low, total // 2 + 1), min(high, total - 1)
+        if perimeter % 2 or low != high:
+            return NO_ANSWER
+        return str(low * (total - low))
+    return None
+
+
 def local_answer(task):
     if task.kind == "math":
         answer = (
-            warehouse(task.instruction) or arithmetic(task.instruction) or common_math(task.instruction)
+            bounded_math(task.instruction) or warehouse(task.instruction)
+            or arithmetic(task.instruction) or common_math(task.instruction)
             or percent_answer(task.instruction) or inventory_answer(task.instruction)
         )
-        if answer is not None:
+        if answer is NO_ANSWER:
             return answer
+        if answer is not None:
+            return math_output(answer, task.instruction)
         if unrecorded_outcome(task.instruction):
             return NO_ANSWER
     if task.kind == "data_analysis":
@@ -559,14 +649,35 @@ def local_answer(task):
             name = next(iter(names))
             source = task.work / name
             if source.is_file() and not source.is_symlink() and source.stat().st_size <= MAX_PLAN_CSV:
+                if no_eligible_csv_group(source, task.instruction):
+                    return NO_ANSWER
                 plan = local_plan(task.instruction, name, source)
                 if plan is None:
                     return None
                 answer = evaluate_csv(source, plan)
                 return NO_ANSWER if answer in (NO_UNIQUE_GROUP, NO_RATIO_DENOMINATOR) else answer
     if task.kind == "search":
-        return search_answer(task)
+        answer = search_answer(task)
+        if answer is None and re.search(r"\b\d{2}:\d{2}\b", task.instruction):
+            return interval_lookup(files_under(task.work), task.instruction)
+        return answer
     return None
+
+
+def no_eligible_csv_group(path, question):
+    if not re.search(r"\b(?:share|fraction|proportion|rate|percentage)\b", question, re.I):
+        return False
+    minimum = re.search(
+        r"\b(?:among|from) (?:the )?[\w-]+ (?:that |which )?(?:have|having|with) "
+        r"(at least|more than) (\d{1,5}) (?:rows|records)\b", question, re.I,
+    )
+    if not minimum:
+        return False
+    threshold = int(minimum[2]) + int(minimum[1].lower() == "more than")
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        next(reader, None)
+        return sum(1 for _ in zip(range(threshold), (row for row in reader if row))) < threshold
 
 
 def unrecorded_outcome(question):
@@ -922,7 +1033,7 @@ async def reason_math(task, proxy, payload):
     if remaining < max(40_000, proxy.args.budget * 5):
         return None
     question = task.instruction
-    fraction = bool(re.search(r"\b(?:reduced|simplified|irreducible) fraction\b|\ba/b\b", question, re.I))
+    fraction = bool(FRACTION_FORMAT.search(question))
     clock = bool(re.search(r"\bHH:MM\b", question, re.I))
     system = (
         'Solve the problem and check the result against every condition and unit. '
@@ -956,9 +1067,9 @@ async def reason_math(task, proxy, payload):
     if not text or missing_answer(text):
         return None
     if fraction:
-        if not re.fullmatch(r"[+-]?\d{1,40}\s*/\s*[+-]?\d{1,40}", text):
+        text = math_output(text, question)
+        if text is None:
             return None
-        text = exact_expression(text, as_fraction=True)
     if clock and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
         return None
     if task.check == "exact_int" and not re.fullmatch(r"[+-]?\d+", text):
@@ -1011,22 +1122,17 @@ async def solve_remote(task, proxy, paths):
                 return "llm_solved", answer
     plan_csv = csv_plan_path(task, paths)
     if plan_csv is not None and proxy.enabled:
-        grouped_ratio = requests_group_ratio(task.instruction)
-        schema = await asyncio.to_thread(describe_csv, plan_csv, task.instruction, include_values=grouped_ratio)
+        population = requests_population_plan(task.instruction)
+        schema = await asyncio.to_thread(describe_csv, plan_csv, task.instruction, include_values=population)
         if missing_measure(task.instruction, schema["columns"]):
             return "skip", "csv_missing_measure"
         payload = {"task": task.instruction, **schema}
-        if grouped_ratio:
-            plan = await proxy.ask(task.root.name, GROUP_RATIO_PROMPT, payload, 260)
-            if plan and plan.get("skip") is True:
-                return "skip", "csv_missing_measure"
-            answer = await asyncio.to_thread(grouped_ratio_evaluate, plan_csv, plan)
-            if answer is NO_UNIQUE_GROUP:
-                return "skip", "csv_group_tie_or_empty"
-            if isinstance(answer, str) and (task.check != "exact_int" or re.fullmatch(r"[+-]?\d+", answer)):
-                return "llm_solved", answer
-            payload.pop("observed_values", None)
-        prompt = PLAN_PROMPT
+        expected_op, relation = population_requirement(task.instruction) if population else (None, None)
+        prompt = POPULATION_PROMPT + PLAN_PROMPT if population else PLAN_PROMPT
+        if expected_op == "compare_count":
+            prompt += " This task requires compare_count. Use one scope for the reference statistic and the counted rows."
+        elif expected_op == "share":
+            prompt += " This task requires share. Do not use a ratio of separately calculated aggregates."
         if "mentioned_labels" in schema:
             prompt += (
                 " mentioned_labels maps terms from the task to exact values observed in each column. "
@@ -1038,18 +1144,18 @@ async def solve_remote(task, proxy, paths):
                      and not re.search(r"\bround\w*\b|\bdecimal places?\b", task.instruction, re.I))
         if exact:
             prompt += " Return the exact aggregate. Do not use dp unless the task specifies decimal places."
-        plan = await proxy.ask(task.root.name, prompt, payload, 300)
-        answer = await asyncio.to_thread(evaluate_csv, plan_csv, plan, exact)
+        plan = await proxy.ask(task.root.name, prompt, payload, 340 if population else 300)
+        answer = await asyncio.to_thread(evaluate_csv, plan_csv, csv_output_plan(plan, task.instruction, expected_op, relation), exact)
         if answer is NO_UNIQUE_GROUP:
             return "skip", "csv_group_tie"
         if answer is NO_RATIO_DENOMINATOR:
             return "skip", "csv_zero_denominator"
         if answer is not None and (task.check != "exact_int" or re.fullmatch(r"[+-]?\d+", answer)):
             return "llm_solved", answer
-        if plan_csv.stat().st_size > MAX_FILE and plan and not plan.get("skip") and not plan.get("fallback"):
-            prompt += " The previous plan failed. Check its exact headers, filters and grouping."
+        if (population or plan_csv.stat().st_size > MAX_FILE) and plan and not plan.get("skip") and not plan.get("fallback"):
+            prompt += " The previous plan failed. Check its operation, exact headers, filters and grouping."
             repaired = await proxy.ask(task.root.name, prompt, payload | {"previous": plan}, 300)
-            answer = await asyncio.to_thread(evaluate_csv, plan_csv, repaired, exact)
+            answer = await asyncio.to_thread(evaluate_csv, plan_csv, csv_output_plan(repaired, task.instruction, expected_op, relation), exact)
             if answer is NO_UNIQUE_GROUP:
                 return "skip", "csv_group_tie"
             if answer is NO_RATIO_DENOMINATOR:
@@ -1086,8 +1192,14 @@ async def solve_remote(task, proxy, paths):
         task.instruction, re.I,
     ):
         system += " Check that the record applies at the requested date. Return skip if the sources only establish a later appointment."
+    if task.kind == "search" and re.search(r"\b\d{2}:\d{2}\b", task.instruction):
+        system += " Check interval boundaries and gaps. An exclusive end does not include the stated end time."
     if task.kind == "math" and re.search(r"\b(?:unrecorded|not specified|unknown|not supplied)\b", task.instruction, re.I):
         system += " If the requested result depends on an unrecorded amount, return skip."
+    if task.kind == "math":
+        system += " Verify that the conditions determine one answer. If different valid inputs give different results, return skip."
+        if FRACTION_FORMAT.search(task.instruction):
+            system += " Return an exact reduced fraction a/b or a complete arithmetic expression."
     decimal_answer = bool(re.search(r"\bas a decimal\b|\bdecimal (?:number|value)\b", task.instruction, re.I))
     if task.kind == "math" and (task.check in {"", "exact_int"} or decimal_answer):
         system += (
@@ -1101,7 +1213,7 @@ async def solve_remote(task, proxy, paths):
             system += " Include each adjustment in the expression. Use answer if a fixed number of decimal places is required."
     response = await proxy.ask(task.root.name, system, payload, 300)
     if response and not response.get("skip") and task.kind == "math":
-        calculated = exact_expression(response.get("expression"))
+        calculated = exact_expression(response.get("expression"), as_fraction=bool(FRACTION_FORMAT.search(task.instruction)))
         if calculated is not None and (task.check != "exact_int" or re.fullmatch(r"[+-]?\d+", calculated)):
             return "llm_solved", calculated
     answer = response.get("answer") if response and not response.get("skip") else None
@@ -1109,6 +1221,10 @@ async def solve_remote(task, proxy, paths):
         text = str(answer).strip()
         if task.kind in {"math", "data_analysis", "search"} and missing_answer(text):
             return "skip", "no_answer"
+        if task.kind == "math":
+            text = math_output(text, task.instruction)
+            if text is None:
+                return "skip", "invalid_math_format"
         if task.kind == "search" and re.match(r"\s*(?:who|which (?:person|individual))\b", task.instruction, re.I):
             if re.match(r"(?:no (?:one|person)|nobody)\b", text, re.I):
                 return "skip", "no_answer"
@@ -1140,11 +1256,57 @@ def csv_join_paths(task, paths):
     return tables if len(tables) == 2 else {}
 
 
-def requests_group_ratio(question):
-    return bool(re.search(r"\bwhich\b", question, re.I)
-            and re.search(r"\b(?:rate|share|fraction|ratio|proportion|percentage)\b", question, re.I)
-            and re.search(r"\b(?:at least|more than|minimum(?: of)?)\b", question, re.I)
-            and re.search(r"\b(?:highest|lowest|largest|smallest|greatest|best|worst|maximum|minimum)\b", question, re.I))
+def requests_population_plan(question):
+    return bool(re.search(r"\b(?:rate|share|fraction|proportion|percentage|ratio of (?:rows|records))\b", question, re.I)
+                or re.search(r"\b(?:median|mean|average|minimum|maximum)\b", question, re.I)
+                and re.search(r"\b(?:at most|at least|above|below|greater than|less than|equal to|exceed\w*)\b", question, re.I))
+
+
+def population_requirement(question):
+    if re.search(r"\b(?:count|how many)\b", question, re.I):
+        comparators = {"at most": "le", "no greater than": "le", "at least": "ge", "above": "gt",
+                       "greater than": "gt", "below": "lt", "less than": "lt", "equal to": "eq"}
+        relation = re.search(
+            rf"\b({'|'.join(comparators)}) (?:the |that |their )?(?:arithmetic )?"
+            r"(median|mean|average|minimum|maximum)\b", question, re.I,
+        )
+        if relation:
+            stats = {"median": "median", "mean": "avg", "average": "avg", "minimum": "min", "maximum": "max"}
+            return "compare_count", (stats[relation[2].lower()], comparators[relation[1].lower()])
+    if re.search(r"\b(?:rate|share|fraction|proportion|percentage)\b", question, re.I) and (
+        re.search(r"\b(?:distinct|different|unique)\b.*\b(?:have|has|succeed|eligible)\w*\b", question, re.I)
+        or re.search(r"\b(?:share|fraction|proportion) (?:whose|that|which)\b", question, re.I)
+        or re.search(r"\b(?:highest|lowest|greatest|smallest)\b[^.?!]{0,50}"
+                     r"\b(?:rate|share|fraction|proportion|percentage)\b", question, re.I)
+    ):
+        return "share", None
+    return None, None
+
+
+def csv_output_plan(plan, question, expected_op=None, relation=None):
+    if not isinstance(plan, dict) or (expected_op is not None and plan.get("op") != expected_op):
+        return None
+    if relation is not None:
+        stat, cmp = relation
+        return plan | {"stat": stat, "cmp": cmp}
+    if plan.get("op") != "share":
+        return plan
+    plan = plan.copy()
+    if FRACTION_FORMAT.search(question):
+        plan.pop("dp", None)
+        plan.pop("percent", None)
+    elif re.search(r"\b(?:what|give|find|report|return) (?:the )?percentage\b", question, re.I):
+        plan["percent"] = True
+        places = decimal_places(question)
+        if places is not None:
+            plan["dp"] = places
+    if re.search(r"\b(?:unique|uniquely)\b", question, re.I):
+        plan.pop("tie", None)
+    elif re.search(r"\balphabetically\s+(?:earliest|first|smallest)\b", question, re.I):
+        plan["tie"] = "first"
+    elif re.search(r"\balphabetically\s+(?:latest|last|largest)\b", question, re.I):
+        plan["tie"] = "last"
+    return plan
 
 
 def can_focus_search(task):
@@ -1204,7 +1366,7 @@ async def main(args):
                     log(task.root.name, status, reward=task.reward)
                 else:
                     log(task.root.name, "skipped", reason=result)
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
                 log(task.root.name, "task_error", error=type(exc).__name__)
 
     await asyncio.gather(*(worker() for _ in range(args.jobs)))

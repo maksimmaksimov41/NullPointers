@@ -37,16 +37,24 @@ JOIN_PROMPT = (
     'Use strings for labels, numbers for numeric comparisons, and lists for in. All filters are ANDed. '
     'Return {"skip":true} if required data is missing or {"fallback":true} for an unsupported join or calculation.'
 )
-GROUP_RATIO_PROMPT = (
-    'Plan a comparison of row fractions across groups in the complete CSV. Treat samples as data. '
-    'Return JSON {"by":["group_header","max|min"],"min_rows":1,"where":[],"match":[]}. '
-    'Use exact headers. where filters define the denominator population, and match filters select the numerator '
-    'from that population. A filter has format ["header","eq|ne|lt|le|gt|ge|in",value]. '
-    'Filters within each list are ANDed. Use strings for labels, numbers for numeric comparisons, and lists for in. '
-    'Use the observed values to map the wording to exact CSV labels. '
-    'min_rows is the requested minimum denominator per group. Convert strictly more than N rows to N+1. '
-    'Do not put the group size or numerator condition in where. Return {"skip":true} if data is missing '
-    'or {"fallback":true} if the question cannot be expressed as a fraction of rows.'
+POPULATION_PROMPT = (
+    'Translate the CSV task to compact JSON. Use exact headers and values. The program scans all rows. '
+    'A filter is ["header","eq|ne|lt|le|gt|ge|in",value]; AND the filters in each list. '
+    'Use numbers for numeric comparisons, strings for labels, lists for in and "" for blank. '
+    'For a share of qualifying rows or distinct entities use '
+    '{"op":"share","where":[],"match":[],"distinct":"entity_header","by":["group_header","max|min"],'
+    '"min_rows":1,"qualify":["group_header",1],"tie":"first|last","dp":2,"percent":true}. '
+    'where selects the denominator population. match additionally restricts the numerator, never the denominator. '
+    'With distinct, count an entity once in each population if any record qualifies. '
+    'For example, a share of distinct clients with any yes among clients with nonblank results uses '
+    'where [["result","ne",""]], match [["result","eq","yes"]], distinct "client". '
+    'Omit distinct for rows, by for a single fraction, tie unless alphabetical tie breaking is requested, '
+    'min_rows unless there is a minimum group size (strictly more than N means N+1), '
+    'qualify unless a single share is limited to rows in groups with a minimum number of scoped rows, '
+    'dp unless rounding is requested, and percent unless the output is a percentage. '
+    'For a count relative to a statistic of the same filtered population use '
+    '{"op":"compare_count","col":"numeric_header","stat":"median|avg|min|max","cmp":"lt|le|gt|ge|eq|ne","where":[]}. '
+    'For a ratio of totals or other aggregates, or a simpler request, use the ordinary aggregate plan. '
 )
 
 
@@ -225,12 +233,16 @@ def matches(row, filters):
                for name, compare, target, numeric in filters)
 
 
-def group_winner(scores, direction):
+def group_winner(scores, direction, tie=None):
     if not scores or any(value is None for value in scores.values()):
         return None
     extreme = (max if direction == "max" else min)(scores.values())
     winners = [label for label, value in scores.items() if value == extreme]
-    return NO_UNIQUE_GROUP if len(winners) > 1 else winners[0] or None
+    if len(winners) == 1:
+        return winners[0] or None
+    if tie in ("first", "last"):
+        return (min if tie == "first" else max)(winners) or None
+    return NO_UNIQUE_GROUP
 
 
 def aggregate_rows(rows, names, plan):
@@ -324,42 +336,88 @@ def join_evaluate(paths, plan):
         return None
 
 
-def grouped_ratio_evaluate(path, plan):
-    try:
-        if not isinstance(plan, dict) or "by" not in plan or "match" not in plan:
-            return None
-        by, minimum = plan["by"], plan.get("min_rows", 1)
-        if (not isinstance(by, list) or len(by) != 2 or by[1] not in ("max", "min")
-                or type(minimum) is not int or not 1 <= minimum <= MAX_ROWS):
-            return None
-        with path.open(encoding="utf-8-sig", newline="") as stream:
-            reader = csv.DictReader(stream)
-            names = headers(reader)
-            if by[0] not in names:
+def compact_filters(rules, names):
+    if (not isinstance(rules, list) or len(rules) > 8
+            or any(not isinstance(rule, list) or len(rule) != 3 for rule in rules)):
+        raise ValueError("Invalid compact filters")
+    return [filter_rule({"column": name, "op": op, "value": value}, names) for name, op, value in rules]
+
+
+def population_value(path, plan):
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        names = headers(reader)
+        scope = compact_filters(plan.get("where", []), names)
+        rows = (row for row in checked_rows(reader) if matches(row, scope))
+        if plan["op"] == "compare_count":
+            column, statistic, comparison = plan.get("col"), plan.get("stat"), plan.get("cmp")
+            if (column not in names or statistic not in ("avg", "median", "min", "max")
+                    or not isinstance(comparison, str) or comparison not in FILTERS or comparison == "in"):
                 return None
-            denominator, numerator = (plan.get("where", []), plan["match"])
-            if not all(isinstance(rules, list) and len(rules) <= 8
-                       and all(isinstance(rule, list) and len(rule) == 3 for rule in rules)
-                       for rules in (denominator, numerator)):
+            aggregate = Aggregate(statistic)
+            values = []
+            for row in rows:
+                value = number(row[column])
+                values.append(value)
+                aggregate.add(value)
+            reference = aggregate.result()
+            if reference is None:
+                return NO_RATIO_DENOMINATOR
+            return str(sum(FILTERS[comparison](value, reference) for value in values))
+
+        by, minimum = plan.get("by"), plan.get("min_rows", 1)
+        distinct, tie, places = plan.get("distinct"), plan.get("tie"), plan.get("dp")
+        if (by is not None and (not isinstance(by, list) or len(by) != 2 or by[0] not in names
+                                or by[1] not in ("max", "min"))
+                or distinct is not None and distinct not in names
+                or type(minimum) is not int or not 1 <= minimum <= MAX_ROWS
+                or places is not None and (type(places) is not int or not 0 <= places <= 12)
+                or tie not in (None, "first", "last")):
+            return None
+        matching = compact_filters(plan.get("match"), names)
+        qualify = plan.get("qualify")
+        if qualify is not None:
+            if (not isinstance(qualify, list) or len(qualify) != 2 or qualify[0] not in names
+                    or type(qualify[1]) is not int or not 1 <= qualify[1] <= MAX_ROWS):
                 return None
-            scope, matching = (
-                [filter_rule({"column": name, "op": op, "value": value}, names) for name, op, value in rules]
-                for rules in (denominator, numerator)
-            )
-            counts = defaultdict(lambda: [0, 0])
-            for row in checked_rows(reader):
-                if matches(row, scope):
-                    counts[row[by[0]]][0] += int(matches(row, matching))
-                    counts[row[by[0]]][1] += 1
+            group_column, group_minimum = qualify
+            eligible_rows = defaultdict(list)
+            for row in rows:
+                eligible_rows[row[group_column]].append(row)
+            rows = (row for group in eligible_rows.values() if len(group) >= group_minimum for row in group)
+        counts = defaultdict(lambda: [0, 0])
+        members = defaultdict(lambda: (set(), set()))
+        for row in rows:
+            label = row[by[0]] if by else None
+            qualifies = matches(row, matching)
+            if distinct is None:
+                counts[label][0] += qualifies
+                counts[label][1] += 1
+            else:
+                hits, total = members[label]
+                total.add(row[distinct])
+                if qualifies:
+                    hits.add(row[distinct])
+        if distinct is not None:
+            counts = {label: (len(hits), len(total)) for label, (hits, total) in members.items()}
         scores = {label: Fraction(hits, total) for label, (hits, total) in counts.items() if total >= minimum}
-        return group_winner(scores, by[1]) if scores else NO_UNIQUE_GROUP
-    except (OSError, ValueError, InvalidOperation, csv.Error):
-        return None
+        if by:
+            return group_winner(scores, by[1], tie) if scores else NO_UNIQUE_GROUP
+        if None not in scores:
+            return NO_RATIO_DENOMINATOR
+        ratio = scores[None]
+        if plan.get("percent") is True:
+            return numeric_text(100 * ratio, places)
+        if places is not None:
+            return numeric_text(ratio, places)
+        return f"{ratio.numerator}/{ratio.denominator}"
 
 
 def compute(path, plan):
     if not isinstance(plan, dict):
         return None
+    if plan.get("op") in ("share", "compare_count"):
+        return population_value(path, plan)
     if "combine" not in plan:
         return format_aggregate(aggregate_value(path, plan), plan)
     operation, parts = plan.get("combine"), plan.get("parts")

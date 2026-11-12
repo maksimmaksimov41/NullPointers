@@ -9,14 +9,14 @@ import tokenize
 
 SAFE_BUILTINS = {
     "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "int",
-    "len", "list", "map", "max", "min", "range", "reversed", "round", "set",
+    "isinstance", "len", "list", "map", "max", "min", "next", "range", "reversed", "round", "set",
     "sorted", "str", "sum", "tuple", "zip",
 }
 SAFE_METHODS = {
     "append", "capitalize", "casefold", "copy", "count", "endswith", "extend",
     "find", "fromkeys", "get", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit",
     "isnumeric", "isspace", "items", "join", "keys", "lower", "lstrip", "pop",
-    "replace", "reverse", "rstrip", "sort", "split", "startswith", "strip",
+    "remove", "replace", "reverse", "rstrip", "sort", "split", "startswith", "strip",
     "upper", "values", "add", "discard", "setdefault", "update",
 }
 # Function rewrites permit ordinary calculations and container operations.
@@ -154,6 +154,24 @@ def conflicting_assertions(test_sources):
             tree = ast.parse(text)
         except SyntaxError:
             continue
+        for suite in tree.body:
+            if not isinstance(suite, ast.ClassDef) or suite.decorator_list or suite.keywords:
+                continue
+            # Compare single-assertion methods in a plain suite without setup hooks.
+            if not all(isinstance(method, ast.FunctionDef) and method.name.startswith("test")
+                       and not method.decorator_list for method in suite.body):
+                continue
+            seen = {}
+            for method in suite.body:
+                if len(method.body) != 1:
+                    continue
+                assertion = literal_assertion(method.body[0])
+                if assertion is None:
+                    continue
+                call, expected = assertion
+                if call in seen and seen[call] != expected:
+                    return True
+                seen[call] = expected
         for function in ast.walk(tree):
             if not isinstance(function, ast.FunctionDef) or not function.name.startswith("test"):
                 continue
@@ -185,7 +203,7 @@ def literal_assertion(statement):
                         positional.append(arg)
                 for arg in positional:
                     ast.literal_eval(arg)
-                return (function, [ast.dump(arg) for arg in positional]), ast.literal_eval(expected)
+                return (function, tuple(ast.dump(arg) for arg in positional)), ast.literal_eval(expected)
             except (ValueError, TypeError):
                 return None
         case _:
@@ -231,6 +249,13 @@ def structural_candidates(function, instruction):
         and re.search(r"\ba single element qualifies\b", instruction)
         and re.search(r"\bempty input (?:gives|returns) \[\]", instruction)
     )
+    half_open_resources = (
+        re.search(r"\bhalf[- ]open intervals?\b", instruction, re.I)
+        and re.search(r"\b(?:minimum|fewest) (?:number of )?(?:machines|rooms|resources|workers|servers)\b", instruction, re.I)
+        and re.search(r"\(\s*start\s*,\s*end\s*\)|\bstart and end times\b", instruction, re.I)
+        and re.search(r"\b(?:each requiring one|each uses one|each needs one|one (?:machine|room|resource|worker|server) per)\b",
+                      instruction, re.I)
+    )
     for statement in function.body:
         if inclusive:
             for node in ast.walk(statement):
@@ -244,6 +269,23 @@ def structural_candidates(function, instruction):
             continue
         value = statement.value
         match value:
+            case ast.Call(func=ast.Name(id="len"), args=[ast.Name(id=sequence)], keywords=[]) if half_open_resources:
+                names = ("events", "start", "end", "active", "peak", "change")
+                if sequence in names:
+                    names = tuple(f"interval_{name}" for name in names)
+                events, start, end, active, peak, change = names
+                yield statement, (
+                    f"{events} = []\n"
+                    f"for {start}, {end} in {sequence}:\n"
+                    f"    if {start} < {end}:\n"
+                    f"        {events}.append(({start}, 1))\n"
+                    f"        {events}.append(({end}, -1))\n"
+                    f"{active} = {peak} = 0\n"
+                    f"for _, {change} in sorted({events}):\n"
+                    f"    {active} += {change}\n"
+                    f"    {peak} = max({peak}, {active})\n"
+                    f"return {peak}"
+                )
             case ast.Call(func=ast.Name(id="min"), args=[ast.Name(id=sequence)], keywords=[]) if min_without_none:
                 item = "item" if sequence != "item" else "element"
                 yield value, f"min(({item} for {item} in {sequence} if {item} is not None), default=None)"
